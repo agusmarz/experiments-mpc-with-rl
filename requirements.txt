@@ -1,0 +1,6 @@
+gymnasium[classic-control]
+casadi
+numpy
+scipy
+matplotlib
+jupyter
