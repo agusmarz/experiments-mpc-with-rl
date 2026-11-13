@@ -1,5 +1,15 @@
-from concurrent.futures import ProcessPoolExecutor
 import os
+
+# Una sola hebra de BLAS/OpenMP por proceso. Tiene que ir ANTES de importar numpy,
+# torch o casadi: cada librería reserva buffers por hebra al cargarse y, con 16
+# hebras, un worker comprometía ~3.3 GB de memoria (contra ~0.4 GB con 1 hebra).
+# Con 15 workers eso supera el límite de memoria virtual de Windows y aparece
+# "MemoryError: bad allocation". El paralelismo ya lo dan los procesos del pool.
+# Los procesos hijos heredan estas variables y además reimportan este módulo.
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
+from concurrent.futures import ProcessPoolExecutor
 from typing import Callable, Sequence
 import numpy as np
 import torch
@@ -103,11 +113,22 @@ def _inicializar_worker(fabrica_evaluador: Callable, arq_red: dict):
     _WORKER_RED.eval()
 
 
-def _evaluar_fenotipo_worker(tarea: tuple[np.ndarray, int, Sequence[dict]]) -> float:
+def _evaluar_fenotipo_worker(tarea: tuple[np.ndarray, int, Sequence[dict]]) -> tuple[float, tuple[bool, ...]]:
+    """Devuelve (score, fallos_inicio): fallos_inicio[j] es True si el MPC no pudo
+    resolver el paso 0 del escenario j (ver AlgoritmoGenetico._verificar_fallos_inicio)."""
     fenotipo, pasos_episodio, escenarios = tarea
     _WORKER_RED.cargar_desde_fenotipo(fenotipo)
     score = float(_WORKER_EVALUADOR.evaluar(_WORKER_RED, pasos_episodio, escenarios))
-    return -np.inf if np.isnan(score) else score
+    fallos = tuple(bool(f) for f in getattr(_WORKER_EVALUADOR, "fallos_inicio", ()))
+    return (-np.inf if np.isnan(score) else score), fallos
+
+
+def _guardar_atomico(objeto, ruta: str) -> None:
+    """torch.save a un temporal y después renombra: si el proceso muere a mitad de
+    la escritura, el archivo anterior queda intacto."""
+    tmp = ruta + ".tmp"
+    torch.save(objeto, tmp)
+    os.replace(tmp, ruta)
 
 
 class AlgoritmoGenetico:
@@ -136,6 +157,13 @@ class AlgoritmoGenetico:
         max_generaciones: int = 150,
         max_gen_sin_mejora: int = 25,
         seed: int | None = None,
+        # Validación: escenarios fijos (los mismos durante todo el entrenamiento)
+        escenarios_validacion: Sequence[dict] | None = None,
+        cada_validacion: int = 10,
+        top_k_validacion: int = 5,
+        # Guardado durante el entrenamiento
+        ruta_checkpoint: str | None = None,
+        ruta_mejor_red: str | None = None,
     ):
         assert tamano_poblacion >= 2
         assert 1 <= num_elites < tamano_poblacion, "num_elites debe ser >= 1 para conservar al mejor."
@@ -187,6 +215,18 @@ class AlgoritmoGenetico:
         self.gen_sin_mejora: int = 0
         self._pool: ProcessPoolExecutor | None = None
 
+        self.escenarios_validacion = list(escenarios_validacion) if escenarios_validacion else []
+        self.cada_validacion = max(1, int(cada_validacion))
+        self.top_k_validacion = max(1, min(int(top_k_validacion), self.tamano_poblacion))
+        self.mejor_fenotipo_validacion: np.ndarray | None = None
+        self.mejor_score_validacion: float = -np.inf
+        self.gen_mejor_validacion: int = 0
+        self.historial_validacion: list[tuple[int, float]] = []  # (generación, mejor del top-k)
+
+        self.ruta_checkpoint = ruta_checkpoint
+        self.ruta_mejor_red = ruta_mejor_red
+        self._red_entregable_cambio = False
+
     def construir_red(self, fenotipo: np.ndarray | None = None) -> RedEstimadora:
         red = RedEstimadora(**self.arq_red)
         if fenotipo is not None:
@@ -194,27 +234,85 @@ class AlgoritmoGenetico:
         return red
 
     def obtener_mejor_red(self) -> RedEstimadora:
-        if self.mejor_fenotipo is None:
+        """La mejor red en validación si ya hubo alguna; si no, el último élite ganador."""
+        fenotipo = (self.mejor_fenotipo_validacion if self.mejor_fenotipo_validacion is not None
+                    else self.mejor_fenotipo)
+        if fenotipo is None:
             raise RuntimeError("Aún no se ha evaluado ningún individuo.")
-        red_optima = self.construir_red(self.mejor_fenotipo)
+        red_optima = self.construir_red(fenotipo)
         red_optima.eval()
         return red_optima
 
-    def _evaluar_poblacion(self, escenarios_generacion: Sequence[dict]) -> None:
+    # ------------------------------------------------------------------ evaluación
+
+    def _mapear(self, tareas: list) -> list[tuple[float, tuple[bool, ...]]]:
+        if self.n_workers > 1 and self._pool is not None:
+            return list(self._pool.map(_evaluar_fenotipo_worker, tareas))
+        if _WORKER_EVALUADOR is None:
+            _inicializar_worker(self.fabrica_evaluador, self.arq_red)
+        return [_evaluar_fenotipo_worker(t) for t in tareas]
+
+    def _verificar_fallos_inicio(self, fallos: np.ndarray, contexto: str, verbose: bool) -> None:
+        """Alarma. `fallos` es (individuos x escenarios): True si el MPC no resolvió el paso 0.
+
+        El paso 0 se resuelve con los parámetros nominales, antes de que la red actúe,
+        así que su resultado depende solo del escenario: o falla para todos los
+        individuos o para ninguno. Si falla en todo, o falla para unos individuos y
+        para otros no, el problema es del entorno (memoria, solver), no de las redes,
+        y seguir entrenando solo produce puntajes basura.
+        """
+        if fallos.size == 0 or not fallos.any():
+            return
+        inconsistente = not np.all(fallos == fallos[0])
+        if fallos.all() or inconsistente:
+            detalle = ("de forma distinta según el individuo (no reproducible)" if inconsistente
+                       else "en todos los escenarios para todos los individuos")
+            raise RuntimeError(
+                f"{contexto}: el MPC no pudo resolver el paso 0 {detalle} "
+                f"({int(fallos.sum())}/{fallos.size} evaluaciones). Ese paso no depende de la red: "
+                "suele ser falta de memoria del sistema (revisá otros procesos de Python) o un "
+                "problema de Ipopt. Se corta el entrenamiento"
+                + (f"; el último checkpoint está en '{self.ruta_checkpoint}'." if self.ruta_checkpoint else ".")
+            )
+        if verbose:
+            n = int(fallos[0].sum())
+            print(f"  Aviso ({contexto}): {n} escenario(s) infactibles desde el paso 0 para "
+                  "todos los individuos; no discriminan entre redes.")
+
+    def _evaluar_poblacion(self, escenarios_generacion: Sequence[dict], verbose: bool = False) -> None:
         tareas = [
             (self.poblacion[i], self.pasos_episodio, escenarios_generacion)
             for i in range(self.tamano_poblacion)
         ]
+        resultados = self._mapear(tareas)
+        self.scores = np.asarray([s for s, _ in resultados], dtype=np.float64)
+        fallos = np.asarray([f for _, f in resultados], dtype=bool)
+        self._verificar_fallos_inicio(fallos, f"Generación {self.generacion_actual + 1}", verbose)
 
-        if self.n_workers > 1 and self._pool is not None:
-            resultados = list(self._pool.map(_evaluar_fenotipo_worker, tareas))
-            self.scores = np.asarray(resultados, dtype=np.float64)
-        else:
-            if _WORKER_EVALUADOR is None:
-                _inicializar_worker(self.fabrica_evaluador, self.arq_red)
-            self.scores = np.asarray(
-                [_evaluar_fenotipo_worker(t) for t in tareas], dtype=np.float64
-            )
+    def _validar(self, candidatos: np.ndarray, verbose: bool) -> dict:
+        """Evalúa cada candidato en los escenarios fijos de validación. Una tarea por
+        (candidato, escenario) para repartir el trabajo entre todos los workers."""
+        n_val = len(self.escenarios_validacion)
+        tareas = [
+            (candidatos[i], self.pasos_episodio, [esc])
+            for i in range(len(candidatos))
+            for esc in self.escenarios_validacion
+        ]
+        resultados = self._mapear(tareas)
+        scores = np.asarray([s for s, _ in resultados], dtype=np.float64).reshape(len(candidatos), n_val)
+        fallos = np.asarray([f[0] for _, f in resultados], dtype=bool).reshape(len(candidatos), n_val)
+        self._verificar_fallos_inicio(fallos, f"Validación gen {self.generacion_actual + 1}", verbose)
+
+        medias = scores.mean(axis=1)
+        mejor = int(np.argmax(medias))
+        mejoro = bool(medias[mejor] > self.mejor_score_validacion)
+        if mejoro:
+            self.mejor_score_validacion = float(medias[mejor])
+            self.mejor_fenotipo_validacion = candidatos[mejor].copy()
+            self.gen_mejor_validacion = self.generacion_actual + 1
+            self._red_entregable_cambio = True
+        self.historial_validacion.append((self.generacion_actual + 1, float(medias[mejor])))
+        return {"scores": medias, "mejor": float(medias[mejor]), "mejoro": mejoro}
 
     def _seleccion_torneo(self) -> np.ndarray:
         indices = self.rng.choice(self.tamano_poblacion, size=self.tamano_torneo, replace=False)
@@ -239,9 +337,9 @@ class AlgoritmoGenetico:
 
         return hijo
 
-    def paso_generacion(self) -> dict:
+    def paso_generacion(self, verbose: bool = False) -> dict:
         escenarios_generacion = self.generador_escenarios(self.num_casos, self.rng)
-        self._evaluar_poblacion(escenarios_generacion)
+        self._evaluar_poblacion(escenarios_generacion, verbose)
 
         # En gen > 0, los índices 0..num_elites-1 son los élites heredados (0 es el mejor anterior)
         score_elite_previo = float(self.scores[0]) if self.generacion_actual > 0 else -np.inf
@@ -259,12 +357,23 @@ class AlgoritmoGenetico:
         if self.generacion_actual == 0 or (orden[0] >= self.num_elites and mejor_gen > score_elite_previo):
             self.mejor_fenotipo = self.poblacion[0].copy()
             self.gen_sin_mejora = 0
+            if self.mejor_fenotipo_validacion is None:
+                self._red_entregable_cambio = True
         else:
             self.gen_sin_mejora += 1
 
         self.mejor_score = mejor_gen
         self.historial_mejor_score.append(mejor_gen)
         self.historial_promedio_score.append(promedio_gen)
+
+        # Validación cada `cada_validacion` generaciones y siempre en la última,
+        # sobre los top-k de esta generación (ya ordenados, antes del reemplazo)
+        validacion = None
+        numero_gen = self.generacion_actual + 1
+        es_ultima = (numero_gen >= self.max_generaciones
+                     or self.gen_sin_mejora >= self.max_gen_sin_mejora)
+        if self.escenarios_validacion and (numero_gen % self.cada_validacion == 0 or es_ultima):
+            validacion = self._validar(self.poblacion[: self.top_k_validacion], verbose)
 
         # Reemplazo generacional con elitismo
         nueva_poblacion = np.empty_like(self.poblacion)
@@ -285,11 +394,79 @@ class AlgoritmoGenetico:
             "mejor_score_generacion": mejor_gen,
             "promedio_score": promedio_gen,
             "gen_sin_mejora": self.gen_sin_mejora,
+            "validacion": validacion,
         }
+
+    # ------------------------------------------------------------------ checkpoint
+
+    def guardar_checkpoint(self, ruta: str) -> None:
+        """Todo lo necesario para reanudar el AG en la generación siguiente. Solo tensores
+        y tipos básicos, para que cargue con torch.load(weights_only=True)."""
+        def a_tensor(arr):
+            return None if arr is None else torch.from_numpy(np.array(arr, dtype=np.float64))
+
+        _guardar_atomico({
+            "generacion": self.generacion_actual,
+            "num_pesos": self.num_pesos,
+            "poblacion": a_tensor(self.poblacion),
+            "scores": a_tensor(self.scores),
+            "mejor_fenotipo": a_tensor(self.mejor_fenotipo),
+            "mejor_score": self.mejor_score,
+            "gen_sin_mejora": self.gen_sin_mejora,
+            "mejor_fenotipo_validacion": a_tensor(self.mejor_fenotipo_validacion),
+            "mejor_score_validacion": self.mejor_score_validacion,
+            "gen_mejor_validacion": self.gen_mejor_validacion,
+            "historial_mejor_score": list(self.historial_mejor_score),
+            "historial_promedio_score": list(self.historial_promedio_score),
+            "historial_validacion": [list(t) for t in self.historial_validacion],
+            "rng": self.rng.bit_generator.state,
+        }, ruta)
+
+    def cargar_checkpoint(self, ruta: str) -> None:
+        """Restaura el estado guardado por `guardar_checkpoint` (misma arquitectura de red)."""
+        c = torch.load(ruta, map_location="cpu", weights_only=True)
+        if c["num_pesos"] != self.num_pesos:
+            raise ValueError(f"El checkpoint es de una red con {c['num_pesos']} pesos y esta tiene {self.num_pesos}.")
+
+        def a_numpy(t):
+            return None if t is None else t.numpy().copy()
+
+        self.generacion_actual = int(c["generacion"])
+        self.poblacion = a_numpy(c["poblacion"])
+        self.tamano_poblacion = self.poblacion.shape[0]
+        self.scores = a_numpy(c["scores"])
+        self.mejor_fenotipo = a_numpy(c["mejor_fenotipo"])
+        self.mejor_score = float(c["mejor_score"])
+        self.gen_sin_mejora = int(c["gen_sin_mejora"])
+        self.mejor_fenotipo_validacion = a_numpy(c["mejor_fenotipo_validacion"])
+        self.mejor_score_validacion = float(c["mejor_score_validacion"])
+        self.gen_mejor_validacion = int(c["gen_mejor_validacion"])
+        self.historial_mejor_score = list(c["historial_mejor_score"])
+        self.historial_promedio_score = list(c["historial_promedio_score"])
+        self.historial_validacion = [(int(g), float(s)) for g, s in c["historial_validacion"]]
+        self.rng.bit_generator.state = c["rng"]
+
+    def _guardar_progreso(self) -> bool:
+        """Checkpoint en cada generación; la red entregable solo cuando cambia.
+        Devuelve True si se reescribió la red."""
+        if self.ruta_checkpoint:
+            self.guardar_checkpoint(self.ruta_checkpoint)
+        if self.ruta_mejor_red and self._red_entregable_cambio:
+            _guardar_atomico(self.obtener_mejor_red().state_dict(), self.ruta_mejor_red)
+            self._red_entregable_cambio = False
+            return True
+        return False
+
+    # ------------------------------------------------------------------ bucle
 
     def ejecutar(self, verbose: bool = True) -> RedEstimadora:
         if verbose:
             print(f"Iniciando AG con {self.n_workers} procesos paralelos en CPU...")
+            if self.escenarios_validacion:
+                print(f"Validación: {len(self.escenarios_validacion)} escenarios fijos, top-{self.top_k_validacion} "
+                      f"cada {self.cada_validacion} generaciones.")
+            if self.generacion_actual > 0:
+                print(f"Reanudando desde la generación {self.generacion_actual}.")
 
         try:
             if self.n_workers > 1:
@@ -299,8 +476,9 @@ class AlgoritmoGenetico:
                     initargs=(self.fabrica_evaluador, self.arq_red),
                 )
 
-            for _ in range(self.max_generaciones):
-                info = self.paso_generacion()
+            while self.generacion_actual < self.max_generaciones:
+                info = self.paso_generacion(verbose)
+                guardo_red = self._guardar_progreso()
                 if verbose:
                     print(
                         f"Gen {info['generacion']:03d} | "
@@ -308,6 +486,17 @@ class AlgoritmoGenetico:
                         f"Prom: {info['promedio_score']:.2f} | "
                         f"Sin mejora: {info['gen_sin_mejora']}/{self.max_gen_sin_mejora}"
                     )
+                    val = info["validacion"]
+                    if val is not None:
+                        print(
+                            f"  Validación | top-{len(val['scores'])}: "
+                            + " ".join(f"{s:.3f}" for s in val["scores"])
+                            + f" | mejor histórico: {self.mejor_score_validacion:.3f} "
+                            f"(gen {self.gen_mejor_validacion:03d})"
+                            + ("  <- nuevo mejor" if val["mejoro"] else "")
+                        )
+                    if guardo_red:
+                        print(f"  Red guardada en {self.ruta_mejor_red}")
 
                 if self.gen_sin_mejora >= self.max_gen_sin_mejora:
                     if verbose:
@@ -322,20 +511,34 @@ class AlgoritmoGenetico:
 
 
 if __name__ == "__main__":
+    import functools
     import numpy as np
     from evaluador_mpc import EvaluadorSimulacionMPC
 
-    def crear_evaluador():
-        return EvaluadorSimulacionMPC(
-            params_iniciales_mpc=(3.0, 1.0, 0.50, 0.01),
-            rangos_params_min=(1.5, 0.4, 0.30, 0.005),
-            rangos_params_max=(5.5, 2.0, 0.90, 0.030),
-            horizonte_mpc=12,  # Horizonte más corto en entrenamiento = solver 3x-4x más rápido
-            escala_delta=(0.04, 0.015, 0.015, 0.0005),
-        )
+    # La fábrica tiene que poder viajar por pickle a los procesos hijos. En Windows
+    # (spawn) los hijos importan este archivo como `__mp_main__` sin ejecutar este
+    # bloque, así que una función definida acá no existe para ellos. Un partial de
+    # la clase se serializa como referencia a `evaluador_mpc.EvaluadorSimulacionMPC`,
+    # que sí pueden importar.
+    crear_evaluador = functools.partial(
+        EvaluadorSimulacionMPC,
+        params_iniciales_mpc=(3.0, 1.0, 0.50, 0.01),
+        rangos_params_min=(1.5, 0.4, 0.30, 0.005),
+        rangos_params_max=(5.5, 2.0, 0.90, 0.030),
+        horizonte_mpc=12,  # Horizonte más corto en entrenamiento = solver 3x-4x más rápido
+        escala_delta=(0.04, 0.015, 0.015, 0.0005),
+    )
+
+    RUTA_CHECKPOINT = "checkpoint_ag.pt"        # estado completo del AG, se pisa cada generación
+    RUTA_MEJOR_RED = "mejor_red_estimadora.pt"  # la red que carga el notebook
+    REANUDAR = False  # True: sigue desde RUTA_CHECKPOINT (si existe) en vez de empezar de cero
 
     # Instancia ligera solo para generar escenarios en el proceso principal
     eval_dummy = crear_evaluador()
+
+    # Validación: siempre los mismos 10 escenarios (semilla propia, independiente de la
+    # del AG), así los puntajes de distintas generaciones se pueden comparar entre sí.
+    escenarios_validacion = eval_dummy.generar_escenarios(10, np.random.default_rng(2024))
 
     ag = AlgoritmoGenetico(
         fabrica_evaluador=crear_evaluador,
@@ -346,7 +549,7 @@ if __name__ == "__main__":
         capas_ocultas=(10, 10),
         dim_salida=4,
         activacion=nn.Tanh,
-        pasos_episodio=200,
+        pasos_episodio=300,      # 3 tramos de 100 pasos: centro, izquierda, derecha
         tamano_poblacion=30,
         tamano_torneo=3,
         num_elites=2,
@@ -359,9 +562,18 @@ if __name__ == "__main__":
         max_generaciones=200,
         max_gen_sin_mejora=10,
         seed=42,
+        escenarios_validacion=escenarios_validacion,
+        cada_validacion=10,
+        top_k_validacion=5,
+        ruta_checkpoint=RUTA_CHECKPOINT,
+        ruta_mejor_red=RUTA_MEJOR_RED,
     )
     eval_dummy.close()
 
+    if REANUDAR and os.path.exists(RUTA_CHECKPOINT):
+        ag.cargar_checkpoint(RUTA_CHECKPOINT)
+
     mejor_red_pytorch = ag.ejecutar(verbose=True)
-    torch.save(mejor_red_pytorch.state_dict(), "mejor_red_estimadora.pt")
-    print("Red óptima guardada:", type(mejor_red_pytorch))
+    _guardar_atomico(mejor_red_pytorch.state_dict(), RUTA_MEJOR_RED)
+    print(f"Red óptima guardada en {RUTA_MEJOR_RED} "
+          f"(validación: {ag.mejor_score_validacion:.3f}, gen {ag.gen_mejor_validacion})")

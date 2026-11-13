@@ -112,12 +112,19 @@ class MPCNoLineal:
         self.holgura = self.opti.variable(1, N)
         self.x_inicial = self.opti.parameter(nx, 1)
         self.theta_params = self.opti.parameter(n_theta, 1)  # [M, m, L, r]
+        # Referencia de posición del carro a lo largo del horizonte, x_ref[0..N].
+        # El equilibrio [x_ref, 0, 0, 0] es válido para cualquier x_ref (la dinámica
+        # no depende de x), así que alcanza con desplazar el costo.
+        self.ref_x = self.opti.parameter(1, N + 1)
+
+        def desvio(k):
+            return self.x[:, k] - ca.vertcat(self.ref_x[0, k], 0, 0, 0)
 
         costo = 0
         for k in range(N):
-            costo += costo_etapa(self.x[:, k], self.u[:, k], Q, self.p.R)
+            costo += costo_etapa(desvio(k), self.u[:, k], Q, self.p.R)
         if costo_terminal is not None:
-            costo += costo_terminal(self.x[:, N])
+            costo += costo_terminal(desvio(N))
         costo += peso_holgura * (ca.sum2(self.holgura) + ca.sumsqr(self.holgura))
         self.opti.minimize(costo)
 
@@ -133,7 +140,7 @@ class MPCNoLineal:
 
         if conjunto_terminal is not None:
             P, alpha = conjunto_terminal
-            self.opti.subject_to(ca.mtimes([self.x[:, N].T, ca.DM(P), self.x[:, N]]) <= alpha)
+            self.opti.subject_to(ca.mtimes([desvio(N).T, ca.DM(P), desvio(N)]) <= alpha)
 
         self.opti.solver('ipopt', {
             'expand': True,
@@ -154,6 +161,7 @@ class MPCNoLineal:
 
         self.theta_actual = np.array([self.p.M, self.p.m, self.p.L, self.p.r], dtype=float)
         self.actualizar_parametros(self.theta_actual)
+        self.opti.set_value(self.ref_x, np.zeros((1, N + 1)))
 
         self.tiempos_solve = []
         self.ultimo_exito = True
@@ -190,16 +198,22 @@ class MPCNoLineal:
         if theta_inicial is not None:
             self.actualizar_parametros(theta_inicial)
 
-    def solve(self, estado, theta=None) -> tuple[float, np.ndarray]:
+    def solve(self, estado, theta=None, x_ref=None) -> tuple[float, np.ndarray]:
         """Resuelve el MPC y devuelve (accion_optima, estado_predicho_siguiente).
 
         Si `theta` se pasa como argumento, actualiza [M, m, L, r] antes de resolver.
+        `x_ref` es la posición de referencia del carro: un escalar (constante en todo
+        el horizonte) o un vector de N + 1 valores para los instantes k..k+N. Con
+        None se regula al centro (x_ref = 0).
         Si los parámetros propuestos vuelven el problema infactible o numéricamente
         inválido, marca `self.ultimo_exito = False` para que el evaluador penalice.
         """
         estado = np.asarray(estado, dtype=float).reshape(-1)
         if theta is not None:
             self.actualizar_parametros(theta)
+        ref = np.zeros(self.N + 1) if x_ref is None else np.broadcast_to(
+            np.asarray(x_ref, dtype=float).reshape(-1), (self.N + 1,))
+        self.opti.set_value(self.ref_x, ref.reshape(1, -1))
 
         # Chequeo rápido de degeneración física (ej. masas o largo <= 0)
         M, m, L, r = self.theta_actual
