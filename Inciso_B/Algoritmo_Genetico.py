@@ -319,24 +319,61 @@ class AlgoritmoGenetico:
         ganador = indices[np.argmax(self.scores[indices])]
         return self.poblacion[ganador].copy()
 
-    def _cruzar(self, padre_1: np.ndarray, padre_2: np.ndarray) -> np.ndarray:
-        mascara = self.rng.random(self.num_pesos) < 0.5
-        return np.where(mascara, padre_1, padre_2)
+    
+    def _cruzar(self, padre1: np.ndarray, padre2: np.ndarray) -> np.ndarray:
+        # Con probabilidad 0.5 clona a padre1 sin cruzar para explotar soluciones locales
+        if np.random.rand() >= 0.5:
+            return padre1.copy()
 
-    def _mutar(self, individuo: np.ndarray) -> np.ndarray:
-        hijo = individuo.copy()
-        if self.num_permutaciones > 0 and self.rng.random() < self.prob_permutacion:
-            for _ in range(self.num_permutaciones):
-                idx_a, idx_b = self.rng.choice(self.num_pesos, size=2, replace=False)
-                hijo[idx_a], hijo[idx_b] = hijo[idx_b], hijo[idx_a]
+        hijo = padre1.copy()
+        capas = [
+        self.arq_red["dim_entrada"],
+        *self.arq_red["capas_ocultas"],
+        self.arq_red["dim_salida"], ]
+       # Ej: [n_entradas, h1, h2, ..., n_salidas]
 
-        if self.rng.random() < self.prob_mutacion_ruido:
-            mascara = self.rng.random(self.num_pesos) < self.tasa_genes_ruido
-            ruido = self.rng.normal(loc=0.0, scale=self.sigma_ruido, size=self.num_pesos)
-            hijo[mascara] += ruido[mascara]
+        # 1. Extraer vistas matriciales dinámicas según la arquitectura
+        Ws_h, bs_h = [], []
+        Ws_p2, bs_p2 = [], []
+        idx = 0
+        for n_in, n_out in zip(capas[:-1], capas[1:]):
+            tam_w = n_out * n_in
+            Ws_h.append(hijo[idx : idx + tam_w].reshape(n_out, n_in))
+            Ws_p2.append(padre2[idx : idx + tam_w].reshape(n_out, n_in))
+            idx += tam_w
+
+            bs_h.append(hijo[idx : idx + n_out])
+            bs_p2.append(padre2[idx : idx + n_out])
+            idx += n_out
+
+        # 2. Cruzar neurona por neurona capa a capa
+        num_transiciones = len(Ws_h)
+        for l in range(num_transiciones):
+            n_neuronas = capas[l + 1]
+            mask = np.random.rand(n_neuronas) < 0.5
+
+            # Pesos entrantes y bias de cada neurona seleccionada en la capa l+1
+            Ws_h[l][mask, :] = Ws_p2[l][mask, :]
+            bs_h[l][mask] = bs_p2[l][mask]
+
+            # Si es capa oculta, también hereda sus pesos salientes hacia la capa siguiente
+            if l + 1 < num_transiciones:
+                Ws_h[l + 1][:, mask] = Ws_p2[l + 1][:, mask]
 
         return hijo
 
+    def _mutar(self, individuo: np.ndarray) -> np.ndarray:
+        mutado = individuo.copy()
+        if np.random.rand() < self.prob_mutacion_ruido:
+            gen = getattr(self, "generacion", 0)
+            max_gens = getattr(self, "n_generaciones", getattr(self, "max_generaciones", 100))
+            progreso = min(1.0, gen / max(1, max_gens - 1))
+            sigma = 0.10 * (1.0 - progreso) + 0.01 * progreso
+
+            mascara = np.random.rand(len(mutado)) < 0.25
+            mutado[mascara] += np.random.normal(0.0, sigma, size=np.sum(mascara))
+        return mutado
+    
     def paso_generacion(self, verbose: bool = False) -> dict:
         escenarios_generacion = self.generador_escenarios(self.num_casos, self.rng)
         self._evaluar_poblacion(escenarios_generacion, verbose)
@@ -546,24 +583,24 @@ if __name__ == "__main__":
         num_casos=5,
         n_workers=None,          # Usa automáticamente todos los núcleos disponibles - 1
         dim_entrada=12,
-        capas_ocultas=(10, 10),
+        capas_ocultas=(32, 32),
         dim_salida=4,
         activacion=nn.Tanh,
         pasos_episodio=300,      # 3 tramos de 100 pasos: centro, izquierda, derecha
         tamano_poblacion=30,
         tamano_torneo=3,
         num_elites=2,
-        prob_mutacion_ruido=0.8,
+        prob_mutacion_ruido=0.5,
         tasa_genes_ruido=0.25,
-        sigma_ruido=0.05,
+        sigma_ruido=0.5,
         prob_permutacion=0.3,
         num_permutaciones=5,
         escala_inicial=0.05,
         max_generaciones=200,
         max_gen_sin_mejora=10,
-        seed=42,
+        #seed=42,
         escenarios_validacion=escenarios_validacion,
-        cada_validacion=10,
+        cada_validacion=5,
         top_k_validacion=5,
         ruta_checkpoint=RUTA_CHECKPOINT,
         ruta_mejor_red=RUTA_MEJOR_RED,
