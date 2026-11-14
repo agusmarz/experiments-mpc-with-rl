@@ -557,8 +557,17 @@ if __name__ == "__main__":
     # bloque, así que una función definida acá no existe para ellos. Un partial de
     # la clase se serializa como referencia a `evaluador_mpc.EvaluadorSimulacionMPC`,
     # que sí pueden importar.
+    # Se pueden pisar con variables de entorno (útil en Kaggle, sin editar el archivo):
+    #   AG_CONTROLADOR = mpc | lqr | lqr_adaptativo
+    #   AG_WORKERS     = cantidad de procesos (por defecto, núcleos - 1)
+    #   AG_REANUDAR    = 1 para seguir desde RUTA_CHECKPOINT
+    CONTROLADOR = os.environ.get("AG_CONTROLADOR", "lqr")  # "lqr" es ~20x más rápido que "mpc"
+    N_WORKERS = int(os.environ["AG_WORKERS"]) if os.environ.get("AG_WORKERS") else None
+    print(f"Controlador de entrenamiento: {CONTROLADOR}")
+
     crear_evaluador = functools.partial(
         EvaluadorSimulacionMPC,
+        controlador=CONTROLADOR,
         params_iniciales_mpc=(3.0, 1.0, 0.50, 0.01),
         rangos_params_min=(1.5, 0.4, 0.30, 0.005),
         rangos_params_max=(5.5, 2.0, 0.90, 0.030),
@@ -568,7 +577,7 @@ if __name__ == "__main__":
 
     RUTA_CHECKPOINT = "checkpoint_ag.pt"        # estado completo del AG, se pisa cada generación
     RUTA_MEJOR_RED = "mejor_red_estimadora.pt"  # la red que carga el notebook
-    REANUDAR = False  # True: sigue desde RUTA_CHECKPOINT (si existe) en vez de empezar de cero
+    REANUDAR = os.environ.get("AG_REANUDAR", "0") == "1"  # True: sigue desde RUTA_CHECKPOINT (si existe)
 
     # Instancia ligera solo para generar escenarios en el proceso principal
     eval_dummy = crear_evaluador()
@@ -581,7 +590,7 @@ if __name__ == "__main__":
         fabrica_evaluador=crear_evaluador,
         generador_escenarios=eval_dummy.generar_escenarios,
         num_casos=5,
-        n_workers=None,          # Usa automáticamente todos los núcleos disponibles - 1
+        n_workers=N_WORKERS,     # None: todos los núcleos disponibles - 1
         dim_entrada=12,
         capas_ocultas=(32, 32),
         dim_salida=4,

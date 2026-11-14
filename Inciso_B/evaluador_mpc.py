@@ -3,6 +3,7 @@ import numpy as np
 
 from pendulo_env_incisoB import ParametrosPlanta, PenduloEnv
 from mpc_no_lineal import MPCNoLineal, costo_terminal_cuadratico, riccati
+from controlador_lqr import ControladorLQR
 from Algoritmo_Genetico import RedEstimadora
 
 
@@ -39,6 +40,12 @@ class EvaluadorSimulacionMPC:
     Cada escenario trae además una referencia de posición del carro que se mueve
     durante el episodio (escalones o senoidal), para excitar la dinámica y que
     el error de predicción tenga información sobre M y m.
+
+    `controlador` elige quién da la acción y la predicción x̂[k+1]:
+        "mpc"             MPCNoLineal con Ipopt (lo original, ~10 ms por paso)
+        "lqr"             ControladorLQR con K nominal fija (~0,5 ms por paso)
+        "lqr_adaptativo"  ControladorLQR con K recalculada con θ̂ en cada paso
+    En los tres la predicción es un paso de RK4 del modelo con θ̂.
     """
 
     def __init__(
@@ -49,6 +56,7 @@ class EvaluadorSimulacionMPC:
         rangos_estado_min: Sequence[float] = (-0.15, -0.20, -0.24, -0.20),
         rangos_estado_max: Sequence[float] = (0.15, 0.20, 0.24, 0.20),
         theta_inicial_min_abs: float = 0.06,
+        controlador: str = "mpc",
         horizonte_mpc: int = 20,
         usar_costo_terminal: bool = True,
         escala_delta: float | Sequence[float] = (0.04, 0.015, 0.015, 0.0005),
@@ -98,11 +106,18 @@ class EvaluadorSimulacionMPC:
         self.env = PenduloEnv(parametros=ParametrosPlanta())
         self.dt = self.env.p.dt
 
-        # Solver NMPC
+        # Controlador (el atributo se sigue llamando `mpc` aunque sea un LQR:
+        # los dos exponen N, ultimo_exito, reiniciar() y solve())
         p_mpc = ParametrosPlanta()
         p_mpc.M, p_mpc.m, p_mpc.L, p_mpc.r = self.params_iniciales_mpc
-        costo_term = costo_terminal_cuadratico(riccati(p_mpc)[0]) if usar_costo_terminal else None
-        self.mpc = MPCNoLineal(p=p_mpc, N=horizonte_mpc, costo_terminal=costo_term)
+        self.controlador = controlador
+        if controlador == "mpc":
+            costo_term = costo_terminal_cuadratico(riccati(p_mpc)[0]) if usar_costo_terminal else None
+            self.mpc = MPCNoLineal(p=p_mpc, N=horizonte_mpc, costo_terminal=costo_term)
+        elif controlador in ("lqr", "lqr_adaptativo"):
+            self.mpc = ControladorLQR(p=p_mpc, adaptativo=(controlador == "lqr_adaptativo"))
+        else:
+            raise ValueError(f"controlador debe ser 'mpc', 'lqr' o 'lqr_adaptativo', no {controlador!r}")
 
     # ------------------------------------------------------------------ escenarios
 
