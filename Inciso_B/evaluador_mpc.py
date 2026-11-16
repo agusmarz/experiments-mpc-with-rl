@@ -1,242 +1,396 @@
-from typing import Sequence
+import math
+from pathlib import Path
+from typing import Callable, Sequence
 import numpy as np
 
-from pendulo_env_incisoB import ParametrosPlanta, PenduloEnv
-from mpc_no_lineal import MPCNoLineal, costo_terminal_cuadratico, riccati
-from controlador_lqr import ControladorLQR
-from Algoritmo_Genetico import RedEstimadora
+try:
+    from scipy.linalg import expm, solve_continuous_are
+    from scipy.optimize import minimize
+    TIENE_SCIPY = True
+except ImportError:
+    TIENE_SCIPY = False
+
+from Algoritmo_Genetico import (
+    DT_SIMULACION,
+    GRAVEDAD,
+    THETA_MAX,
+    THETA_MIN,
+    THETA_NOMINAL,
+    RedEstimadora,
+    paso_rk4,
+)
 
 
-def referencia_carro(ref: dict | None, pasos, dt: float, pasos_por_tramo: int = 100,
-                     secuencia_escalones: Sequence[float] = (0.0, -1.0, 1.0)) -> np.ndarray:
-    """Posición de referencia del carro en los pasos indicados (array de enteros).
+def referencia_escalon_simple(t: float) -> np.ndarray:
+    x_ref = 0.5 if t >= 0.4 else 0.0
+    return np.array([x_ref, 0.0, 0.0, 0.0], dtype=np.float64)
 
-    ref = None                                         -> centro (0)
-    ref = {"tipo": "escalones", "amplitud": A}         -> A * secuencia, un valor por
-          tramo de `pasos_por_tramo` pasos; la secuencia se repite si el episodio sigue
-    ref = {"tipo": "senoidal", "amplitud": A, "frecuencia": f, "fase": phi}
-                                                       -> A * sin(2π f k dt + phi)
-    """
-    k = np.asarray(pasos, dtype=np.float64)
-    if ref is None:
-        return np.zeros_like(k)
-    if ref["tipo"] == "escalones":
-        secuencia = np.asarray(secuencia_escalones, dtype=np.float64)
-        idx = (k // pasos_por_tramo).astype(int) % len(secuencia)
-        return ref["amplitud"] * secuencia[idx]
-    if ref["tipo"] == "senoidal":
-        return ref["amplitud"] * np.sin(2.0 * np.pi * ref["frecuencia"] * k * dt + ref.get("fase", 0.0))
-    raise ValueError(f"Tipo de referencia desconocido: {ref['tipo']}")
+
+def referencia_excitacion_persistente(t: float) -> np.ndarray:
+    if t < 1.5:
+        escalon = 0.45
+    elif t < 3.2:
+        escalon = -0.45
+    elif t < 4.8:
+        escalon = 0.35
+    else:
+        escalon = -0.25
+
+    onda = 0.20 * math.sin(2.2 * t) + 0.10 * math.sin(5.1 * t)
+    return np.array([escalon + onda, 0.0, 0.0, 0.0], dtype=np.float64)
+
+
+def referencia_origen(t: float) -> np.ndarray:
+    return np.zeros(4, dtype=np.float64)
+
+
+class ControladorMPC:
+    def __init__(
+        self,
+        horizonte: int = 25,
+        dt: float = DT_SIMULACION,
+        Q: Sequence[float] = (18.0, 1.5, 80.0, 8.0),
+        R: float = 0.08,
+        R_delta: float = 0.04,
+        u_max: float = 35.0,
+        tol_actualizacion: float = 1e-4,
+    ) -> None:
+        self.N = int(horizonte)
+        self.dt = float(dt)
+        self.Q = np.diag(np.asarray(Q, dtype=np.float64))
+        self.R = float(R)
+        self.R_delta = float(R_delta)
+        self.u_max = float(u_max)
+        self.tol_actualizacion = float(tol_actualizacion)
+
+        self._theta_cache: np.ndarray | None = None
+        self._u_prev: float = 0.0
+        self._u_warm: np.ndarray = np.zeros(self.N, dtype=np.float64)
+
+        self._Sx: np.ndarray | None = None
+        self._Su: np.ndarray | None = None
+        self._Q_bar: np.ndarray | None = None
+        self._D: np.ndarray | None = None
+        self._H: np.ndarray | None = None
+
+    def reiniciar(self) -> None:
+        self._u_prev = 0.0
+        self._u_warm = np.zeros(self.N, dtype=np.float64)
+
+    @staticmethod
+    def _linealizar_continuo(params: Sequence[float]) -> tuple[np.ndarray, np.ndarray]:
+        M, m, L, r = float(params[0]), float(params[1]), float(params[2]), float(params[3])
+        l = 0.5 * L
+        J = m * ((r ** 2) / 4.0 + (L ** 2) / 3.0)
+        det0 = (M + m) * J - (m * l) ** 2
+
+        A_c = np.array(
+            [
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, -(m ** 2 * GRAVEDAD * l ** 2) / det0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+                [0.0, 0.0, ((M + m) * m * GRAVEDAD * l) / det0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+        B_c = np.array([[0.0], [J / det0], [0.0], [-(m * l) / det0]], dtype=np.float64)
+        return A_c, B_c
+
+    def _discretizar_zoh(self, A_c: np.ndarray, B_c: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if TIENE_SCIPY:
+            M_aug = np.zeros((5, 5), dtype=np.float64)
+            M_aug[:4, :4] = A_c * self.dt
+            M_aug[:4, 4:5] = B_c * self.dt
+            exp_M = expm(M_aug)
+            return exp_M[:4, :4], exp_M[:4, 4:5]
+
+        I4 = np.eye(4, dtype=np.float64)
+        Adt = A_c * self.dt
+        Adt2 = Adt @ Adt
+        Adt3 = Adt2 @ Adt
+        Adt4 = Adt3 @ Adt
+        A_d = I4 + Adt + Adt2 / 2.0 + Adt3 / 6.0 + Adt4 / 24.0
+        Phi = I4 * self.dt + (A_c * (self.dt ** 2)) / 2.0 + (Adt2 * self.dt) / 6.0
+        B_d = Phi @ B_c
+        return A_d, B_d
+
+    def _calcular_costo_terminal(self, A_c: np.ndarray, B_c: np.ndarray) -> np.ndarray:
+        if TIENE_SCIPY:
+            try:
+                return solve_continuous_are(A_c, B_c, self.Q, np.array([[self.R]]))
+            except Exception:
+                pass
+        return 4.0 * self.Q
+
+    def _actualizar_modelo_interno(self, theta: np.ndarray) -> None:
+        if (
+            self._theta_cache is not None
+            and np.max(np.abs(theta - self._theta_cache)) < self.tol_actualizacion
+        ):
+            return
+
+        A_c, B_c = self._linealizar_continuo(theta)
+        A_d, B_d = self._discretizar_zoh(A_c, B_c)
+        P_term = self._calcular_costo_terminal(A_c, B_c)
+
+        N = self.N
+        Sx = np.zeros((4 * N, 4), dtype=np.float64)
+        Su = np.zeros((4 * N, N), dtype=np.float64)
+
+        potencias_A = [np.eye(4, dtype=np.float64)]
+        for _ in range(N):
+            potencias_A.append(potencias_A[-1] @ A_d)
+
+        for i in range(N):
+            Sx[4 * i : 4 * (i + 1), :] = potencias_A[i + 1]
+            for j in range(i + 1):
+                col = (potencias_A[i - j] @ B_d).ravel()
+                Su[4 * i : 4 * (i + 1), j] = col
+
+        Q_bar = np.zeros((4 * N, 4 * N), dtype=np.float64)
+        for i in range(N - 1):
+            Q_bar[4 * i : 4 * (i + 1), 4 * i : 4 * (i + 1)] = self.Q
+        Q_bar[4 * (N - 1) : 4 * N, 4 * (N - 1) : 4 * N] = P_term
+
+        D = np.eye(N, dtype=np.float64)
+        for i in range(1, N):
+            D[i, i - 1] = -1.0
+
+        R_bar = self.R * np.eye(N, dtype=np.float64)
+        Rd_bar = self.R_delta * np.eye(N, dtype=np.float64)
+
+        H = 2.0 * (Su.T @ Q_bar @ Su + R_bar + D.T @ Rd_bar @ D)
+        H = 0.5 * (H + H.T)
+
+        self._Sx = Sx
+        self._Su = Su
+        self._Q_bar = Q_bar
+        self._D = D
+        self._H = H
+        self._theta_cache = theta.copy()
+
+    def calcular_accion(
+        self,
+        estado_actual: np.ndarray,
+        referencia_horizonte: np.ndarray,
+        theta_modelo: np.ndarray,
+    ) -> float:
+        self._actualizar_modelo_interno(np.asarray(theta_modelo, dtype=np.float64))
+        assert self._Sx is not None and self._Su is not None
+        assert self._Q_bar is not None and self._D is not None and self._H is not None
+
+        x0 = np.asarray(estado_actual, dtype=np.float64)
+        ref = np.asarray(referencia_horizonte, dtype=np.float64)
+        if ref.ndim == 1:
+            X_ref = np.tile(ref, self.N)
+        else:
+            X_ref = ref.reshape(-1)
+
+        d0 = np.zeros(self.N, dtype=np.float64)
+        d0[0] = self._u_prev
+
+        err_libre = self._Sx @ x0 - X_ref
+        f = 2.0 * (self._Su.T @ (self._Q_bar @ err_libre) - self.R_delta * (self._D.T @ d0))
+
+        H = self._H
+
+        if TIENE_SCIPY:
+            bounds = [(-self.u_max, self.u_max)] * self.N
+            res = minimize(
+                fun=lambda u: 0.5 * float(u @ (H @ u)) + float(f @ u),
+                x0=self._u_warm,
+                jac=lambda u: H @ u + f,
+                method="L-BFGS-B",
+                bounds=bounds,
+                options={"maxiter": 60, "ftol": 1e-9},
+            )
+            u_opt = res.x
+        else:
+            L_lip = float(np.linalg.norm(H, 2)) + 1e-8
+            alpha = 1.0 / L_lip
+            u_opt = self._u_warm.copy()
+            for _ in range(80):
+                u_opt = np.clip(u_opt - alpha * (H @ u_opt + f), -self.u_max, self.u_max)
+
+        u0 = float(np.clip(u_opt[0], -self.u_max, self.u_max))
+        self._u_prev = u0
+        self._u_warm = np.concatenate([u_opt[1:], u_opt[-1:]])
+        return u0
 
 
 class EvaluadorSimulacionMPC:
-    """Evalúa una `RedEstimadora` en lazo cerrado con `MPCNoLineal` y `PenduloEnv`
-    sobre múltiples escenarios aleatorios por generación.
-
-    El fitness mide qué tan cerca terminan los parámetros estimados θ̂ de los
-    reales θ*, relativo al error de partida (0 = perfecto, -1 = igual que no
-    adaptar). Caerse o volver infactible el MPC se penaliza aparte.
-
-    Cada escenario trae además una referencia de posición del carro que se mueve
-    durante el episodio (escalones o senoidal), para excitar la dinámica y que
-    el error de predicción tenga información sobre M y m.
-
-    `controlador` elige quién da la acción y la predicción x̂[k+1]:
-        "mpc"             MPCNoLineal con Ipopt (lo original, ~10 ms por paso)
-        "lqr"             ControladorLQR con K nominal fija (~0,5 ms por paso)
-        "lqr_adaptativo"  ControladorLQR con K recalculada con θ̂ en cada paso
-    En los tres la predicción es un paso de RK4 del modelo con θ̂.
-    """
-
     def __init__(
         self,
-        params_iniciales_mpc: Sequence[float] = (3.0, 1.0, 0.5, 0.01),
-        rangos_params_min: Sequence[float] = (1.5, 0.4, 0.30, 0.005),
-        rangos_params_max: Sequence[float] = (5.5, 2.0, 0.90, 0.030),
-        rangos_estado_min: Sequence[float] = (-0.15, -0.20, -0.24, -0.20),
-        rangos_estado_max: Sequence[float] = (0.15, 0.20, 0.24, 0.20),
-        theta_inicial_min_abs: float = 0.06,
-        controlador: str = "mpc",
-        horizonte_mpc: int = 20,
-        usar_costo_terminal: bool = True,
-        escala_delta: float | Sequence[float] = (0.04, 0.015, 0.015, 0.0005),
-        # Fitness
-        pesos_params: Sequence[float] = (1.0, 1.0, 1.0, 0.1),
-        fraccion_final: float = 0.25,
-        penalizacion_caida: float = 2.0,
-        peso_suavizado_delta: float = 0.01,
-        penalizacion_infactible: float = 2.0,
-        # Referencia de posición
-        tipos_referencia: Sequence[str] = ("escalones", "senoidal"),
-        rango_amplitud_ref: tuple[float, float] = (0.10, 0.25),
-        secuencia_escalones: Sequence[float] = (0.0, -1.0, 1.0),
-        pasos_por_tramo: int = 100,
-        rango_frecuencia_ref: tuple[float, float] = (0.1, 0.4),
-        seed_env: int = 42,
-    ):
-        self.params_iniciales_mpc = np.asarray(params_iniciales_mpc, dtype=np.float64).reshape(4)
-        self.rangos_params_min = np.asarray(rangos_params_min, dtype=np.float64).reshape(4)
-        self.rangos_params_max = np.asarray(rangos_params_max, dtype=np.float64).reshape(4)
-        self.rango_params = self.rangos_params_max - self.rangos_params_min
-        self.rangos_estado_min = np.asarray(rangos_estado_min, dtype=np.float64).reshape(4)
-        self.rangos_estado_max = np.asarray(rangos_estado_max, dtype=np.float64).reshape(4)
-        self.theta_inicial_min_abs = float(theta_inicial_min_abs)
-
-        self.escala_delta = np.asarray(escala_delta, dtype=np.float64)
-        self.pesos_params = np.asarray(pesos_params, dtype=np.float64).reshape(4)
-        self.fraccion_final = float(fraccion_final)
-        self.penalizacion_caida = float(penalizacion_caida)
-        self.peso_suavizado_delta = float(peso_suavizado_delta)
-        self.penalizacion_infactible = float(penalizacion_infactible)
-
-        self.tipos_referencia = tuple(tipos_referencia)
-        self.rango_amplitud_ref = tuple(rango_amplitud_ref)
-        self.secuencia_escalones = np.asarray(secuencia_escalones, dtype=np.float64)
-        self.pasos_por_tramo = int(pasos_por_tramo)
-        self.rango_frecuencia_ref = tuple(rango_frecuencia_ref)
-        self.seed_env = seed_env
-
-        # Por escenario de la última llamada a evaluar(): True si el MPC no pudo
-        # resolver el paso 0. Ese paso no depende de la red, así que el AG lo usa
-        # para detectar problemas del entorno (por ejemplo, falta de memoria).
-        self.fallos_inicio: list[bool] = []
-        self._fallo_inicio = False
-
-        # Entorno de simulación (se pasa ParametrosPlanta() explícitamente)
-        self.env = PenduloEnv(parametros=ParametrosPlanta())
-        self.dt = self.env.p.dt
-
-        # Controlador (el atributo se sigue llamando `mpc` aunque sea un LQR:
-        # los dos exponen N, ultimo_exito, reiniciar() y solve())
-        p_mpc = ParametrosPlanta()
-        p_mpc.M, p_mpc.m, p_mpc.L, p_mpc.r = self.params_iniciales_mpc
-        self.controlador = controlador
-        if controlador == "mpc":
-            costo_term = costo_terminal_cuadratico(riccati(p_mpc)[0]) if usar_costo_terminal else None
-            self.mpc = MPCNoLineal(p=p_mpc, N=horizonte_mpc, costo_terminal=costo_term)
-        elif controlador in ("lqr", "lqr_adaptativo"):
-            self.mpc = ControladorLQR(p=p_mpc, adaptativo=(controlador == "lqr_adaptativo"))
+        red_estimadora: RedEstimadora | str | Path | None = None,
+        controlador_mpc: ControladorMPC | None = None,
+        dt: float = DT_SIMULACION,
+    ) -> None:
+        if isinstance(red_estimadora, (str, Path)):
+            self.red: RedEstimadora | None = RedEstimadora.cargar(red_estimadora)
         else:
-            raise ValueError(f"controlador debe ser 'mpc', 'lqr' o 'lqr_adaptativo', no {controlador!r}")
+            self.red = red_estimadora
 
-    # ------------------------------------------------------------------ escenarios
+        self.mpc = controlador_mpc if controlador_mpc is not None else ControladorMPC(dt=dt)
+        self.dt = float(dt)
 
-    def _sortear_referencia(self, rng: np.random.Generator) -> dict:
-        tipo = self.tipos_referencia[rng.integers(len(self.tipos_referencia))]
-        amplitud = float(rng.uniform(*self.rango_amplitud_ref))
-        if tipo == "escalones":
-            return {"tipo": "escalones", "amplitud": amplitud}
-        if tipo == "senoidal":
-            return {
-                "tipo": "senoidal",
-                "amplitud": amplitud,
-                "frecuencia": float(rng.uniform(*self.rango_frecuencia_ref)),
-                "fase": float(rng.uniform(0.0, 2.0 * np.pi)),
-            }
-        raise ValueError(f"Tipo de referencia desconocido: {tipo}")
+    def simular(
+        self,
+        theta_real: Sequence[float],
+        modo: str = "adaptativo",
+        theta_inicial: Sequence[float] = THETA_NOMINAL,
+        estado_inicial: Sequence[float] = (0.0, 0.0, 0.08, 0.0),
+        pasos: int = 300,
+        fn_referencia: Callable[[float], np.ndarray] = referencia_excitacion_persistente,
+        ruido_medicion_std: Sequence[float] | None = None,
+        semilla: int = 123,
+    ) -> dict:
+        modo = modo.lower().strip()
+        if modo not in {"adaptativo", "nominal", "oraculo"}:
+            raise ValueError("El modo debe ser 'adaptativo', 'nominal' u 'oraculo'.")
+        if modo == "adaptativo" and self.red is None:
+            raise ValueError("Se requiere una RedEstimadora cargada para el modo 'adaptativo'.")
 
-    def generar_escenarios(self, num_casos: int, rng: np.random.Generator) -> list[dict]:
-        """Genera `num_casos` plantas reales, estados iniciales y referencias aleatorias."""
-        escenarios: list[dict] = []
-        for _ in range(num_casos):
-            params_reales = rng.uniform(self.rangos_params_min, self.rangos_params_max)
-            x0 = rng.uniform(self.rangos_estado_min, self.rangos_estado_max)
+        rng = np.random.default_rng(semilla)
+        self.mpc.reiniciar()
 
-            # Garantizar una inclinación inicial mínima para excitar la dinámica
-            if abs(x0[2]) < self.theta_inicial_min_abs:
-                signo = -1.0 if rng.random() < 0.5 else 1.0
-                max_th = max(abs(self.rangos_estado_min[2]), abs(self.rangos_estado_max[2]))
-                x0[2] = signo * rng.uniform(self.theta_inicial_min_abs, max_th)
+        theta_real_arr = np.asarray(theta_real, dtype=np.float32)
+        if modo == "oraculo":
+            theta_est = theta_real_arr.copy()
+        else:
+            theta_est = np.asarray(theta_inicial, dtype=np.float32).copy()
+            theta_est[3] = THETA_NOMINAL[3]
 
-            escenarios.append({
-                "reales": params_reales,
-                "x0": x0,
-                "ref": self._sortear_referencia(rng),
-            })
-        return escenarios
+        estado_real = np.asarray(estado_inicial, dtype=np.float64).copy()
+        std_ruido = (
+            np.asarray(ruido_medicion_std, dtype=np.float64)
+            if ruido_medicion_std is not None
+            else None
+        )
 
-    def referencia(self, ref: dict | None, pasos) -> np.ndarray:
-        """Posición de referencia del carro en los pasos indicados (array de enteros).
+        tiempos = np.arange(pasos, dtype=np.float64) * self.dt
+        hist_real = np.zeros((pasos, 4), dtype=np.float64)
+        hist_pred = np.zeros((pasos, 4), dtype=np.float64)
+        hist_ref = np.zeros((pasos, 4), dtype=np.float64)
+        hist_u = np.zeros(pasos, dtype=np.float64)
+        hist_theta = np.zeros((pasos, 4), dtype=np.float32)
+        hist_err_pred = np.zeros((pasos, 4), dtype=np.float64)
+        hist_deltas = np.zeros((pasos, 4), dtype=np.float32)
 
-        escalones: amplitud * secuencia_escalones, un valor por tramo de
-                   `pasos_por_tramo` pasos; la secuencia se repite si el episodio sigue.
-        senoidal:  amplitud * sin(2π f k dt + fase).
-        """
-        return referencia_carro(ref, pasos, self.dt, self.pasos_por_tramo, self.secuencia_escalones)
+        estable = True
+        pasos_validos = pasos
 
-    def _ref_horizonte(self, ref: dict | None, k: int) -> np.ndarray:
-        """Referencia para los instantes k..k+N que ve el MPC (preview completo)."""
-        return self.referencia(ref, np.arange(k, k + self.mpc.N + 1))
+        for k in range(pasos):
+            t = tiempos[k]
 
-    # ------------------------------------------------------------------ fitness
+            if std_ruido is not None:
+                estado_medido = estado_real + rng.normal(0.0, std_ruido)
+            else:
+                estado_medido = estado_real.copy()
 
-    def _error_parametrico(self, theta: np.ndarray, reales: np.ndarray) -> float:
-        """Error cuadrático ponderado, con cada parámetro normalizado por su rango."""
-        e = (theta - reales) / self.rango_params
-        return float(np.sum(self.pesos_params * e**2) / np.sum(self.pesos_params))
-
-    def _puntaje(self, errores, err_inicial, pasos_hechos, pasos_episodio, suavizado, fallo) -> float:
-        """0 = θ̂ terminó en θ*, -1 = igual que el nominal, < -1 = empeoró."""
-        n = max(1, int(round(self.fraccion_final * len(errores)))) if errores else 0
-        err_final = float(np.mean(errores[-n:])) if n else err_inicial
-        score = -err_final / max(err_inicial, 1e-3)
-        score -= self.peso_suavizado_delta * suavizado / max(pasos_hechos, 1)
-        if fallo:
-            score -= self.penalizacion_caida * (1.0 - pasos_hechos / pasos_episodio)
-        return score
-
-    def _correr_un_escenario(self, red: RedEstimadora, pasos_episodio: int, esc: dict) -> float:
-        """Ejecuta un episodio completo sobre un escenario dado."""
-        reales = np.asarray(esc["reales"], dtype=np.float64)
-        ref = esc.get("ref")
-        self.env.p.M, self.env.p.m, self.env.p.L, self.env.p.r = reales
-        x0 = np.asarray(esc["x0"], dtype=np.float64)
-        estado_real, _ = self.env.reset(seed=self.seed_env, options={"estado": x0})
-
-        theta_mpc = self.params_iniciales_mpc.copy()
-        self.mpc.reiniciar(theta_inicial=theta_mpc)
-        err_inicial = self._error_parametrico(theta_mpc, reales)
-        errores: list[float] = []
-        suavizado = 0.0
-
-        u_opt, x_pred_siguiente = self.mpc.solve(estado_real, x_ref=self._ref_horizonte(ref, 0))
-        if not self.mpc.ultimo_exito:
-            self._fallo_inicio = True
-            return -1.0 - self.penalizacion_infactible
-
-        estado_real, _, terminated, truncated, _ = self.env.step([u_opt])
-        if terminated or truncated:
-            return self._puntaje(errores, err_inicial, 1, pasos_episodio, 0.0, fallo=True)
-
-        for k in range(1, pasos_episodio):
-            error_pred = estado_real - x_pred_siguiente
-            delta_theta = red.predecir(theta_mpc, estado_real, error_pred)
-            theta_mpc = theta_mpc + self.escala_delta * delta_theta
-            suavizado += float(np.sum(delta_theta**2))
-            errores.append(self._error_parametrico(theta_mpc, reales))
-
-            u_opt, x_pred_siguiente = self.mpc.solve(
-                estado_real, theta=theta_mpc, x_ref=self._ref_horizonte(ref, k)
+            ref_horizonte = np.array(
+                [fn_referencia(t + j * self.dt) for j in range(self.mpc.N)],
+                dtype=np.float64,
             )
-            if not self.mpc.ultimo_exito:
-                return (self._puntaje(errores, err_inicial, k, pasos_episodio, suavizado, fallo=True)
-                        - self.penalizacion_infactible)
+            ref_actual = ref_horizonte[0]
 
-            estado_real, _, terminated, truncated, _ = self.env.step([u_opt])
-            if terminated or truncated:
-                return self._puntaje(errores, err_inicial, k + 1, pasos_episodio, suavizado, fallo=True)
+            u = self.mpc.calcular_accion(estado_medido, ref_horizonte, theta_est)
 
-        return self._puntaje(errores, err_inicial, pasos_episodio, pasos_episodio, suavizado, fallo=False)
+            estado_pred = paso_rk4(estado_medido, u, theta_est, self.dt)
+            estado_siguiente = paso_rk4(estado_real, u, theta_real_arr, self.dt)
 
-    def evaluar(self, red: RedEstimadora, pasos_episodio: int, escenarios: Sequence[dict]) -> float:
-        """Evalúa la red en todos los escenarios de la generación y devuelve el score promedio."""
-        scores = []
-        self.fallos_inicio = []
-        for esc in escenarios:
-            self._fallo_inicio = False
-            scores.append(self._correr_un_escenario(red, pasos_episodio, esc))
-            self.fallos_inicio.append(self._fallo_inicio)
-        return float(np.mean(scores))
+            if std_ruido is not None:
+                estado_siguiente_medido = estado_siguiente + rng.normal(0.0, std_ruido)
+            else:
+                estado_siguiente_medido = estado_siguiente
 
-    def close(self):
-        self.env.close()
+            error_pred = estado_siguiente_medido - estado_pred
+
+            if modo == "adaptativo":
+                assert self.red is not None
+                delta = self.red.predecir(u, estado_siguiente_medido, error_pred, theta_est)
+                theta_est = np.clip(theta_est + delta, THETA_MIN, THETA_MAX)
+                theta_est[3] = THETA_NOMINAL[3]
+            else:
+                delta = np.zeros(4, dtype=np.float32)
+
+            hist_real[k] = estado_real
+            hist_pred[k] = estado_pred
+            hist_ref[k] = ref_actual
+            hist_u[k] = u
+            hist_theta[k] = theta_est
+            hist_err_pred[k] = error_pred
+            hist_deltas[k] = delta
+
+            estado_real = estado_siguiente
+
+            if abs(estado_real[2]) > 1.3 or abs(estado_real[0]) > 5.0:
+                estable = False
+                pasos_validos = k + 1
+                break
+
+        tiempos = tiempos[:pasos_validos]
+        hist_real = hist_real[:pasos_validos]
+        hist_pred = hist_pred[:pasos_validos]
+        hist_ref = hist_ref[:pasos_validos]
+        hist_u = hist_u[:pasos_validos]
+        hist_theta = hist_theta[:pasos_validos]
+        hist_err_pred = hist_err_pred[:pasos_validos]
+        hist_deltas = hist_deltas[:pasos_validos]
+
+        tramo_final = max(1, pasos_validos // 4)
+        theta_final_media = np.mean(hist_theta[-tramo_final:, :3], axis=0)
+        err_abs_final = np.abs(theta_final_media - theta_real_arr[:3])
+        err_rel_final_pct = 100.0 * err_abs_final / theta_real_arr[:3]
+
+        metricas = {
+            "modo": modo,
+            "estable": estable,
+            "pasos_completados": pasos_validos,
+            "rmse_x": float(np.sqrt(np.mean((hist_real[:, 0] - hist_ref[:, 0]) ** 2))),
+            "rmse_theta_deg": float(np.degrees(np.sqrt(np.mean(hist_real[:, 2] ** 2)))),
+            "rmse_pred_total": float(np.sqrt(np.mean(hist_err_pred ** 2))),
+            "energia_u": float(np.sum(hist_u ** 2) * self.dt),
+            "theta_final_estimado": theta_final_media,
+            "mae_M": float(err_abs_final[0]),
+            "mae_m": float(err_abs_final[1]),
+            "mae_L": float(err_abs_final[2]),
+            "err_rel_pct_M": float(err_rel_final_pct[0]),
+            "err_rel_pct_m": float(err_rel_final_pct[1]),
+            "err_rel_pct_L": float(err_rel_final_pct[2]),
+        }
+
+        return {
+            "t": tiempos,
+            "estados_reales": hist_real,
+            "estados_predichos": hist_pred,
+            "referencias": hist_ref,
+            "acciones_u": hist_u,
+            "theta_estimado": hist_theta,
+            "theta_real": theta_real_arr,
+            "errores_prediccion": hist_err_pred,
+            "deltas_theta": hist_deltas,
+            "metricas": metricas,
+        }
+
+    def comparar_modos(
+        self,
+        theta_real: Sequence[float],
+        theta_inicial: Sequence[float] = THETA_NOMINAL,
+        estado_inicial: Sequence[float] = (0.0, 0.0, 0.08, 0.0),
+        pasos: int = 300,
+        fn_referencia: Callable[[float], np.ndarray] = referencia_excitacion_persistente,
+        ruido_medicion_std: Sequence[float] | None = None,
+    ) -> dict[str, dict]:
+        modos = ["nominal", "adaptativo", "oraculo"] if self.red is not None else ["nominal", "oraculo"]
+        resultados = {}
+        for m in modos:
+            resultados[m] = self.simular(
+                theta_real=theta_real,
+                modo=m,
+                theta_inicial=theta_inicial,
+                estado_inicial=estado_inicial,
+                pasos=pasos,
+                fn_referencia=fn_referencia,
+                ruido_medicion_std=ruido_medicion_std,
+            )
+        return resultados
