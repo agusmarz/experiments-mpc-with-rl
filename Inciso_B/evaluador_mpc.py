@@ -381,7 +381,7 @@ class EvaluadorSimulacionMPC:
         fn_referencia: Callable[[float], np.ndarray] = referencia_excitacion_persistente,
         ruido_medicion_std: Sequence[float] | None = None,
     ) -> dict[str, dict]:
-        modos = ["nominal", "adaptativo", "oraculo"] if self.red is not None else ["nominal", "oraculo"]
+        modos = ["nominal", "adaptativo"] if self.red is not None else ["nominal"]
         resultados = {}
         for m in modos:
             resultados[m] = self.simular(
