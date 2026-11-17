@@ -176,6 +176,9 @@ class MPCNoLineal:
         u_sol = np.reshape(solucion.value(self.u), self._u_guess.shape)
         holgura_sol = np.reshape(solucion.value(self.holgura), self._holgura_guess.shape)
         self.ultima_holgura = float(np.max(holgura_sol))
+        # Costo óptimo J*_N(x) (etapas + terminal + holgura): es el target de la
+        # iteración de valor del eje A, (T V)(x) con el MPC como operador de Bellman
+        self.ultimo_costo = float(solucion.value(self.opti.f))
 
         # Warm start: uso el resultado del instante previo para inicializar
         # la nueva búsqueda, eliminando el primer elemento y repitiendo el último
