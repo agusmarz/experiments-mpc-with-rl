@@ -33,9 +33,6 @@ from pendulo_env import PenduloEnv, ParametrosPlanta  # noqa: E402
 from mpc_no_lineal import MPCNoLineal, costo_terminal_cuadratico, riccati  # noqa: E402
 
 
-# Conjunto de ajustes. Los pesos son la diagonal de Q_mpc (orden x, x_d, th, th_d).
-# Reemplazar por los que salgan de la grilla clásica, y SIEMPRE incluir el mejor
-# ajuste fijo theta* para que la política RL lo contenga como caso particular.
 AJUSTES = [
     {"nombre": "base",        "Q": [10.0, 1.0, 100.0, 1.0], "R": 0.1, "N": 10},
     {"nombre": "agresivo",    "Q": [10.0, 1.0, 400.0, 4.0], "R": 0.1, "N": 10},
@@ -46,10 +43,10 @@ AJUSTES = [
 
 @dataclass
 class ConfigFQI:
-    M: int = 10                       # pasos de control por decisión (10 x 20 ms = 0,2 s)
+    M: int = 10                       
     gamma: float = 0.95
-    n_estados: int = 2000             # lote sincrónico, misma lógica que el eje A
-    n_episodios: int = 200            # lote de episodios encadenados
+    n_estados: int = 2000             
+    n_episodios: int = 200           
     decisiones_por_episodio: int = 25
     iteraciones: int = 60
     congelar_desde: int = 20          # a partir de acá la estructura del bosque queda fija
@@ -161,7 +158,7 @@ class BosqueCongelado:
     Con la estructura fija los pesos k(x, x_i) dependen solo de las entradas,
     el operador de FQI es una contracción de módulo gamma y la iteración converge.
     Si se reconstruye el bosque en cada iteración los cortes dependen de y, y esa
-    garantía formal se pierde (Ernst et al., 2005)."""
+    garantía formal se pierde"""
 
     def __init__(self, bosque, X):
         self.bosque = bosque
