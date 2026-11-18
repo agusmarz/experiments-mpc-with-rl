@@ -14,8 +14,8 @@ FQI
     1. Q_0 = 0, entonces el primer objetivo es y = r
     2. ajustar Q_{k+1} por regresión de Q(s_i, a_i) sobre y_i
     3. y_i = r_i + gamma (1 - d_i) max_a' Q_{k+1}(s'_i, a'), volver a 2
-Las simulaciones no dependen de Q, por eso se hacen una sola vez y las
-iteraciones solo recalculan objetivos y reajustan el regresor.
+        donde d_i = 1 si la transición es terminal, 0 si no lo es.
+
 """
 
 import dataclasses
@@ -32,7 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "simulador"))
 from pendulo_env import PenduloEnv, ParametrosPlanta  # noqa: E402
 from mpc_no_lineal import MPCNoLineal, costo_terminal_cuadratico, riccati  # noqa: E402
 
-
+# El espacio de acciones es discreto, viene dado por estos 4 ajustes del MPC
+# El agente tiene que elegir cada M pasos, cuál de estos ajustes usar.
 AJUSTES = [
     {"nombre": "base",        "Q": [10.0, 1.0, 100.0, 1.0], "R": 0.1, "N": 10},
     {"nombre": "agresivo",    "Q": [10.0, 1.0, 400.0, 4.0], "R": 0.1, "N": 10},
@@ -43,16 +44,15 @@ AJUSTES = [
 
 @dataclass
 class ConfigFQI:
-    M: int = 10                       
-    gamma: float = 0.95
+    M: int = 10        # pasos de control entre decisiones del agente               
+    gamma: float = 0.95 
     n_estados: int = 2000             
     n_episodios: int = 200           
     decisiones_por_episodio: int = 25
     iteraciones: int = 60
-    congelar_desde: int = 20          # a partir de acá la estructura del bosque queda fija
+    congelar_desde: int = 20          # a partir de acá los umbrales de los árboles se congelan y solo se recalculan los valores de las hojas
     n_arboles: int = 50
     min_muestras_corte: int = 4
-    c_N: float = 0.0                  # costo por paso de horizonte (si N es parte del ajuste)
     percentil_c_barra: float = 99.0
     semilla: int = 0
     caja: np.ndarray = field(default_factory=lambda: np.array([0.45, 2.0, 0.8, 4.0]))
@@ -133,7 +133,7 @@ def a_arreglos(datos):
 
 
 def espejar(S, A, C, S2, D):
-    """El sistema es impar (sin torque de perturbación y con pesos diagonales),
+    """El sistema es impar,
     así que (s, a, c, s', d) tiene su espejo (-s, a, c, -s', d)."""
     return (np.vstack([S, -S]), np.concatenate([A, A]), np.concatenate([C, C]),
             np.vstack([S2, -S2]), np.concatenate([D, D]))
@@ -142,8 +142,7 @@ def espejar(S, A, C, S2, D):
 def recompensas(C, A, D, cfg, ajustes=AJUSTES):
     """r en [-1, 0] por intervalo y r = -1/(1 - gamma) en la falla.
     c_barra se toma como un percentil alto del costo de los intervalos sin falla."""
-    N_accion = np.array([ajustes[a]["N"] for a in A])
-    costo = C + cfg.c_N * N_accion
+    costo = C 
     c_barra = np.percentile(costo[D == 0], cfg.percentil_c_barra)
     R = -np.minimum(costo / c_barra, 1.0)
     R[D == 1] = -1.0 / (1.0 - cfg.gamma)
